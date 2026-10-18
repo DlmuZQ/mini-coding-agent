@@ -1,22 +1,34 @@
 import {open, realpath, stat} from 'node:fs/promises';
 import path, { isAbsolute, relative, resolve, sep, win32 } from 'node:path';
 import type { ChatCompletionTool } from 'openai/resources/chat/completions';
+import { ToolError } from './tools/types';
+import type { ToolDefinition } from './tools/types';
 
 const MAX_FILE_BYTES = 32 * 1024;
 
+export type ReadFileArgs = {path: string};
+export type ReadFileData = {path: string; content: string};
+
+export function validateReadFile(value: unknown): value is ReadFileArgs {
+    return value !== null && typeof value === "object" && !Array.isArray(value) && 
+    Object.keys(value).length === 1 && Object.hasOwn(value, "path") && 
+    "path" in value && typeof value.path === "string" && /\S/.test(value.path);
+}
+
 // 描述信息，给模型识别
-export const readFileTool: ChatCompletionTool = {
-  type: 'function',
-  function: {
-    name: 'read_file',
-    description: '读取工作区目录下的文件内容, 最大 32 KiB。path 必须为相对路径。',
-    parameters: {
-      type: 'object',
-      properties: {
-        path: { type: 'string', description: '相对路径，必须以 ./ 开头' },
-      },
+export const readFileTool: ToolDefinition<ReadFileArgs, ReadFileArgs> = {
+  name: 'read_file',
+  description: '读取工作区目录下的文件内容, 最大 32 KiB。path 必须为相对路径。',
+  parameters: {
+    type: 'object',
+    properties: {
+      path: { type: 'string', description: '相对路径，必须以 ./ 开头' },
     },
+    required: ['path'],
+    additionalProperties: false,
   },
+  validate: validateReadFile,
+  execute: (args, context) => readFile(context.workspace, args.path),
 };
 
 function checkPath(root: string, target: string): void {
@@ -29,28 +41,18 @@ function checkPath(root: string, target: string): void {
   }
 }
 
-export async function executeReadFile(workspace: string, argumentsJson: string): Promise<string> {
+export async function readFile(workspace: string, path: string): Promise<ReadFileData> {
     try {
-        let args: unknown;
-        try {
-            args = JSON.parse(argumentsJson);
-        } catch (error) {
-            throw new Error("解析参数失败。");
-        }
-        if (!args || typeof args !== "object" || Array.isArray(args) || !("path" in args)
-        || typeof args.path !== "string" || !args.path.trim() || Object.keys(args).length !== 1) {
-            throw new Error("参数必须且仅有一个 path 字段。");
-        }
-        if(isAbsolute(args.path) || win32.isAbsolute(args.path) || args.path.startsWith("\0")) {
-            throw new Error("path 必须是工作区的相对路径。");
+        if(isAbsolute(path) || win32.isAbsolute(path) || path.startsWith("\0")) {
+            throw new ToolError("INVALID_PATH");
         }
         const root = await realpath(workspace);
-        const candidate = resolve(root, args.path);
+        const candidate = resolve(root, path);
         checkPath(root, candidate);
         const target = await realpath(candidate);
         checkPath(root, target);
         if(!(await stat(target)).isFile()) {
-            throw new Error("只能读取普通文件。");
+            throw new ToolError("NOT_FOUND");
         }
 
         const file = await open(target, "r");
@@ -66,21 +68,23 @@ export async function executeReadFile(workspace: string, argumentsJson: string):
                 total += bytesRead;
             }
             if(total > MAX_FILE_BYTES) {
-                throw new Error("文件太大吵过 32 KiB，展示支持。");
+                throw new ToolError("TOO_LARGE");
             }
             const bytes = buffer.subarray(0, total);
             let content: string;
             try {
                 content = new TextDecoder("utf-8", {fatal: true}).decode(bytes);
             } catch (error) {
-                throw new Error("文件编码错误，不是 UTF-8 编码。");
+                throw new ToolError("INVALID_UTF8");
             }
-            return JSON.stringify({ok: true, path: args.path, content});
+            return {path, content};
         } finally {
             await file.close();
         }
     } catch (error) {
-        const message = error instanceof Error && !("code" in error) ? error.message : "文件不存在或者无法读取";
-        return JSON.stringify({ok: false, error: message});
+        if(error instanceof ToolError) throw error;
+        const code = error && typeof error === "object" && "code" in error ? error.code : undefined;
+        if(code === "ENOENT" || code === "ENOTDIR") throw new ToolError("NOT_FOUND");
+        throw new ToolError("READ_FAILED");
     }
 }

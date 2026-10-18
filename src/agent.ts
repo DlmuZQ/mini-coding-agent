@@ -1,6 +1,8 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import type { AskModel } from "./model";
-import { executeReadFile, readFileTool } from "./read-file";
+import { createBuiltinRegistry } from "./tools/builtins";
+import { dispatchTool } from "./tools/dispatch";
+import type { ToolRegistry } from "./tools/registry";
 
 export type Trace = (label: string, data: unknown) => void;
 function visibleMessage(message: ChatCompletionMessageParam): object {
@@ -19,8 +21,10 @@ export async function runAgent(options: {
     askModel: AskModel;
     trace?: Trace;
     maxRounds?: number;
+    registry?: ToolRegistry;
 }): Promise<string> {
     const {prompt, workspace, askModel, trace = () => {}, maxRounds = 6} = options;
+    const registry = options.registry ?? createBuiltinRegistry();
     if(!prompt.trim()) throw new Error("prompt 不能为空");
     if(!Number.isInteger(maxRounds) || maxRounds < 1) throw new Error("maxRounds 必须为正整数");
     const messages: ChatCompletionMessageParam[] = [
@@ -28,9 +32,10 @@ export async function runAgent(options: {
         {role: "user", content: prompt},
     ];
     for(let round = 1; round <= maxRounds; round++) {
-        trace(`请求 ${round}：messages + tools(公开字段)`, {messages: structuredClone(messages.map(visibleMessage)), tools:[readFileTool]});
-        const assistant = await askModel(messages); // 1. 模型决策
-        trace(`响应 ${round}：assistant`, visibleMessage(assistant));
+        const tools = registry.modelTools();
+        trace(`请求 ${round}:messages + tools(公开字段)`, {messages: structuredClone(messages.map(visibleMessage)), tools});
+        const assistant = await askModel(messages, tools); // 1. 模型决策
+        trace(`响应 ${round}:assistant`, visibleMessage(assistant));
         messages.push(assistant); // 工具请求本身必须保留，不能只保存工具结果
 
         const calls = assistant.tool_calls ?? [];
@@ -41,11 +46,9 @@ export async function runAgent(options: {
         }
         for(const call of calls) {
             if(call.type !== "function") throw new Error("工具调用类型错误");
-            const content = call.function.name === "read_file" ? 
-            await executeReadFile(workspace, call.function.arguments) : //2. 宿主执行
-            JSON.stringify({ok: false, error: "不支持的工具"});
+            const content = JSON.stringify(await dispatchTool(registry, call.function, {workspace}));// 2. 校验后，宿主执行
             const result: ChatCompletionMessageParam = {role: "tool", content, tool_call_id: call.id};
-            trace(`工具 ${call.id}：result`, result);
+            trace(`工具 ${call.id}:result`, result);
             messages.push(result); // 3. 结果回灌，然后进入下一轮。
         }
     }

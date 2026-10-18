@@ -1,8 +1,7 @@
 import OpenAI from "openai";
-import type { ChatCompletionMessage, ChatCompletionMessageParam } from "openai/resources/chat/completions";
-import { readFileTool } from "./read-file";
+import type { ChatCompletionMessage, ChatCompletionMessageParam, ChatCompletionTool } from "openai/resources/chat/completions";
 
-export type AskModel = (messages: ChatCompletionMessageParam[]) => Promise<ChatCompletionMessage>;
+export type AskModel = (messages: ChatCompletionMessageParam[], tools?: ChatCompletionTool[]) => Promise<ChatCompletionMessage>;
 
 export function createModel(env: Record<string, string | undefined> = process.env) : AskModel {
     const apiKey = env.LLM_API_KEY?.trim();
@@ -25,12 +24,11 @@ export function createModel(env: Record<string, string | undefined> = process.en
     }
     
     const client = new OpenAI({apiKey, baseURL, timeout: 30000, maxRetries: 0});
-    return async (messages) => {
+    return async (messages, tools) => {
         const response = await client.chat.completions.create({
             model,
             messages,
-            tools: [readFileTool],
-            tool_choice: "auto",
+            ...(tools?.length ? {tools, tool_choice: "auto" as const} : {}),
             stream: false,
             max_tokens: 2048,
         });
